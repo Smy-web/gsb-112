@@ -90,7 +90,7 @@ Error code: 401 - {'error': {'message': 'Incorrect API key provided: sk-abc1****
 - 任何情况下不得把 `settings.OPENAI_API_KEY`、`settings.OPENAI_BASE_URL`、请求头、或异常文本里的凭据片段写进返回值、日志、或任何落盘产物。脱敏要在异常文本离开这个方法之前做完。
 
 > 用哪种方式暴露失败：抛一个自定义异常（类名你定，须继承 `Exception`、带可读原因），还是返回一个带 `ok` / `error` 键的结构体——两种都符合契约，选定一种并写明。选结构体就等于改了返回类型，上游那三处 `meeting.summary = await ...` 会存进去一个 dict，你要写清调用方该怎么改；选异常则上游那段 `try/except Exception` 会自然走到 `status="failed"`。三个方法必须用同一种。
-> 选定方案：（待填）
+> 选定方案：抛自定义异常 `AIServiceError`（继承 `Exception`，消息是脱敏后的可读原因）。三个 `generate_*` 与 T2 的 `transcribe_audio` 共用这一个异常类型。理由：上游整段处理本来就包在 `try/except Exception` 里，抛异常会自然走到 `status="failed"`，上游一行都不用改；选结构体则上游三处赋值会把 dict 当正文存库，还得逐个改调用点。脱敏在 `raise` 之前由模块内 `_sanitize()` 完成：抹掉 `settings.OPENAI_API_KEY`、`settings.OPENAI_BASE_URL`、`settings.PYANNOTE_AUTH_TOKEN` 的原文，以及 `sk-...` 形态的密钥片段（含 openai 自己打码后的 `sk-abc1****xyz`）。
 
 **T2 `transcribe_audio` 的失败必须让上游停得下来。** 现状失败返回 `{"transcript": "", "segments": [], "error": str(e)}`，成功返回 `{"transcript": ..., "segments": [...]}` ——**成功那一边没有 `error` 键**。上游从不检查 `error`，拿着空串一路往下走：摘要、文案、回向清单全是对着空转写生成的，最后 `status="completed"`。运维看到的是「这场会处理完了」，点开纪要是一片空。音频被清理掉、路径写错、配额用完，表现全都一样。
 
@@ -101,7 +101,7 @@ Error code: 401 - {'error': {'message': 'Incorrect API key provided: sk-abc1****
 - 失败原因同样要过 T1 的脱敏。
 
 > 失败怎么表达：直接抛自定义异常（与 T1 同一种），还是让 `error` 键**恒在**——成功时值为 `None`、失败时为非空的可读原因字符串，由上游判断。两种都符合契约，选定一种并写明。选后者就等于要求上游加一句 `if transcript_result["error"]: ...`，写清楚。
-> 选定方案：（待填）
+> 选定方案：抛 `AIServiceError`，与 T1 同一种口味。成功返回形状保持 `{"transcript": str, "segments": [...]}` 不变、不带 `error` 键；失败（文件不存在、SDK 报错、配额用完）一律抛 `AIServiceError`，原因先过 `_sanitize()`。理由：与 T1 自洽——失败表达全模块只有「抛 `AIServiceError`」一种口味，上游现有的 `try/except Exception` 对各处失败一视同仁地兜到 `status="failed"`；若选 `error` 键恒在，上游从不检查它，等于把「停不停」寄托在一次上游改造上，这正是现状事故的根子。
 
 **T3 `diarize_speakers` 不许把哨兵混进分段列表。** 现状 pyannote 不可用时返回 `[{"error": "No module named 'pyannote'"}]` —— 一个只含 `error`、没有 `start`/`end`/`speaker` 的字典，混在「说话人分段」列表里。上游 `meeting.speaker_diarization = {"segments": speaker_segments}` 原样落库，前端时间轴于是多出一段画不出来的「分段」，标注同事拿到 JSON 还得先猜哪个键在。本环境没装 pyannote，这条路径必然触发。
 
@@ -112,7 +112,7 @@ Error code: 401 - {'error': {'message': 'Incorrect API key provided: sk-abc1****
 - 空列表必须能被下游安全消化：`align_transcript_with_speakers` 拿到空列表时，每条转写段仍要出一条结果，`speaker` 为 `"UNKNOWN"`（这是现状，属 preserve，要有测试钉住）。
 
 > 「另以某种方式告知」用哪种：标准库 `logging` 记一条 warning、抛自定义异常、还是在实例上留一个可用性标记（如 `self.diarization_available`）——三种都符合契约，选定一种并写明。注意上游现在没有一处检查这个：选抛异常，就等于让整条处理链在每一台没装 pyannote 的机器上直接 `status="failed"`，转写和文案全都不做了。这个后果要不要接受，写清楚。
-> 选定方案：（待填）
+> 选定方案：返回空列表 + `logging` 记一条 warning（消息含脱敏后的原因，如 `No module named 'pyannote'`）。理由：客堂内网机器没装 pyannote 是常态而非异常，选抛异常等于每台离线机器场场 `status="failed"`、转写和三段正文全废，这个后果不接受；实例标记上游没有任何一处会读，等于没说。空列表下游有兜底：`align_transcript_with_speakers` 给每段打 `"UNKNOWN"`，`identify_speaker_roles` 对 `"UNKNOWN"` 不发请求（T5），上游 `.get(speaker, "未知")` 兜住角色——会议照常出纪要，运维在日志里能看到分离没生效。
 **T4 `identify_speaker_roles` 的返回值必须落在白名单里。** 现状是 `role = response.choices[0].message.content.strip()` 之后原样 `speaker_roles[speaker] = role`。提示词里写了「请只返回角色名称」，但模型实际会回一整句——`这个人应该是负责木作的老工匠师傅，语气比较像住持` 也照存。这句话经上游 `speaker_role=speaker_roles.get(speaker, "未知")` 写进 `dialogue_turns.speaker_role`，再被渲染层印成 `> **SPEAKER_00（这个人应该是负责木作的老工匠师傅，语气比较像住持）** [12.0s - 18.0s]：……`，进了群发邮件，也进了前端那个按角色筛选的下拉框——下拉框里于是多出十几个谁也认不出的「角色」。异常时静默降级成 `"未知"`，日志里一句都没有，运维无法区分「模型判不出来」和「请求根本没成功」。
 
 契约：
@@ -122,7 +122,7 @@ Error code: 401 - {'error': {'message': 'Incorrect API key provided: sk-abc1****
 - 请求失败时不得静默：必须用标准库 `logging` 记一条 warning，写清是哪个 speaker 失败的、失败原因是什么。原因里同样不得含凭据（见 T1）。
 
 > 两处要你定：① 白名单外的值归到 `其他` 还是保留上游那个 `未知` 字样（`未知` 不在白名单里，选它就等于把它加进白名单，写清楚）；② 从模型回的整句里抠白名单词，是按白名单固定优先级取第一个命中的、按在句子里出现的先后取、还是干脆只在整句**恰好等于**白名单词时才认——抠不出来时归到哪里，一并写明。
-> 选定方案：（待填）
+> 选定方案：① 归到 `其他`，白名单保持 `{住持, 监院, 工匠, 设计师, 居士, 其他}` 六项，`未知` 不进白名单——`未知` 是上游 `.get(speaker, "未知")` 的兜底措辞，表示「没判过」，不该成为本层产出的判定结果。② 归一规则（`_normalize_role()`）：先去掉全部空白字符（含换行）；若整串恰好等于某个白名单词，用之；否则取在句中**出现位置最靠前**的白名单词（模型习惯把结论放在句首，如「这个人应该是负责木作的老工匠师傅，语气比较像住持」会归到 `工匠` 而非 `住持`）；一个都抠不出来（白名单外的词、空串、纯标点）归 `其他`。请求失败时记一条 warning（含是哪个 speaker、脱敏后的原因），该 speaker 归 `其他`，不再静默。
 
 **T5 `UNKNOWN` 不发请求。** 现状 `align_transcript_with_speakers` 给分不到说话人的段落打 `"UNKNOWN"`，`identify_speaker_roles` 把它当成一个真说话人，照发一次请求，问「说话人UNKNOWN的身份角色」。离线场景下分离必然失败（T3），于是**每一场会都白发一次请求**：钱和时延白花，回来的角色还要被印进纪要。
 
@@ -141,7 +141,7 @@ Error code: 401 - {'error': {'message': 'Incorrect API key provided: sk-abc1****
 - 输入不合法（缺 `text`、缺 `start`/`end`、时间不是数）时，不许让裸 `KeyError` / `TypeError` 传到调用方。
 
 > 不合法的那一段怎么办：跳过它并 `logging` 记一条 warning（其余段照常出结果，输出条数会少于输入，上游就少建一条 `DialogueTurn`），还是抛一个带可读原因的自定义异常（整场会失败，但日志里能看出是第几段、缺哪个键）——两种都符合契约，选定一种并写明。选跳过，就要接受「一场会少几句发言也没人发现」；选抛，就要接受一句脏数据毁掉整场会。
-> 选定方案：（待填）
+> 选定方案：抛 `AIServiceError`，消息带第几段、缺哪个键或哪个键不是数（如 `第 1 段转写缺少键 'text'`、`第 0 段转写的 'start' 不是数字: '12.5'`）。理由（与 T3 的分工）：T3 是**能力降级**——分离不可用，但转写本身可信，会议值得继续开完，所以返回空列表并 warning；T6 是**数据损坏**——转写产物本身缺键，说明上游通道出了问题，此时静默跳过会产出一份「少几句发言也没人发现」的纪要并标 `completed` 群发出去，没有任何一环替运维兜底。抛异常则上游走 `status="failed"`，日志里是完整可读的原因，运维不用拿着 `KeyError: 'text'` 里一个引号猜一下午。
 
 **本次明确不在范围**：重叠为 0 时归 `"UNKNOWN"`、平局时按输入顺序取胜（把 `speaker_segments` 反转过来结果就变）、`overlap > max_overlap` 用的是严格大于——这套切分与平局算法**保持现状**，别改，也别拿它当验收点。另有排期。
 
@@ -153,7 +153,7 @@ Error code: 401 - {'error': {'message': 'Incorrect API key provided: sk-abc1****
 - 现有 `SPEAKER_00..04` → `甲乙丙丁戊` 这五项映射保持现状（preserve）；`SPEAKER_NAMES` 这个模块级名字保留。
 
 > 超出五项怎么生成：继续按天干往下排（己庚辛壬癸，排完十个之后怎么办）、用「说话人6」这种直白写法、还是别的一致的规则——你定，写清规则和它的上限行为。另外，不像 `SPEAKER_\d+` 的键（人工补录进来的 `"法师A"`、`"监院"`）怎么办，也一并写明。
-> 选定方案：（待填）
+> 选定方案：`SPEAKER_00`–`SPEAKER_09` 按天干 `甲乙丙丁戊己庚辛壬癸` 取（`SPEAKER_NAMES` 原有五项保持不动，`SPEAKER_05` 起由 `_speaker_display_name()` 按同一规则生成）；`SPEAKER_10` 及以上改用「说话人N」（N = 编号 + 1，如 `SPEAKER_10` → `说话人11`），天干排完十位后不再硬造生僻代称。不匹配 `SPEAKER_<数字>` 的键（人工补录的 `法师A`、`监院` 等）原样保留——它们本身已是可读称呼。任何情况下裸 `SPEAKER_<数字>` id 不进提示词。
 
 **T8 离线 import 必须成功，且不发任何网络请求。** 现状模块末尾 `ai_service = AIService()`，`AIService.__init__` 里就构造 `AsyncOpenAI(api_key=settings.OPENAI_API_KEY, base_url=settings.OPENAI_BASE_URL)`，而 `OPENAI_API_KEY` 默认是空串。
 
@@ -194,4 +194,4 @@ Error code: 401 - {'error': {'message': 'Incorrect API key provided: sk-abc1****
 
 ### 本次做题人填写
 
-（把你的取舍和理由写在这里。）
+六处口径的共同点：失败表达全模块统一为「抛 `AIServiceError`（消息已脱敏）」（T1、T2、T6），因为上游那段 `try/except Exception` 是现成且唯一被验证过的失败通道，选它上游零改动；唯独 T3 选「返回空列表 + warning」，因为分离不可用是离线部署的常态而非故障，不值得赔上整场会。T4 归一到 `其他` 而不是 `未知`，保住白名单六项的封闭性；抠词按「句中出现位置最靠前」而非固定优先级，因为模型习惯把结论放句首。T7 天干排满十位后改「说话人N」，规则一致且无上限。

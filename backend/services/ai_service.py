@@ -1,8 +1,63 @@
-import os
 import json
+import logging
+import re
 from typing import List, Dict, Any, Optional
 from openai import AsyncOpenAI
 from ..config import settings
+
+logger = logging.getLogger(__name__)
+
+
+class AIServiceError(Exception):
+    """AI 服务层失败。消息已脱敏，可直接展示给运维。"""
+
+
+ROLE_WHITELIST = ("住持", "监院", "工匠", "设计师", "居士", "其他")
+
+_HEAVENLY_STEMS = "甲乙丙丁戊己庚辛壬癸"
+
+_KEY_PATTERN = re.compile(r"sk-[\w*\-]+")
+
+
+def _sanitize(text: Optional[str]) -> str:
+    """在异常文本离开本模块前抹掉凭据：完整密钥、base_url、token、sk- 片段。"""
+    if not text:
+        return ""
+    for secret in (
+        settings.OPENAI_API_KEY,
+        settings.OPENAI_BASE_URL,
+        settings.PYANNOTE_AUTH_TOKEN,
+    ):
+        if secret:
+            text = text.replace(secret, "***")
+    return _KEY_PATTERN.sub("sk-***", text)
+
+
+def _speaker_display_name(speaker: str) -> str:
+    """任意 SPEAKER_<数字> 都要有可读中文代称；其余键原样保留。"""
+    if speaker in SPEAKER_NAMES:
+        return SPEAKER_NAMES[speaker]
+    match = re.fullmatch(r"SPEAKER_(\d+)", speaker)
+    if match:
+        index = int(match.group(1))
+        if index < len(_HEAVENLY_STEMS):
+            return _HEAVENLY_STEMS[index]
+        return f"说话人{index + 1}"
+    return speaker
+
+
+def _normalize_role(raw: Optional[str]) -> str:
+    """把模型原文归一到 ROLE_WHITELIST：去空白后恰等于白名单词则用之；
+    否则取在句中出现位置最靠前的白名单词；都不命中归「其他」。"""
+    text = re.sub(r"\s+", "", raw or "")
+    if text in ROLE_WHITELIST:
+        return text
+    hits = [
+        (text.find(role), role) for role in ROLE_WHITELIST if text.find(role) >= 0
+    ]
+    if hits:
+        return min(hits)[1]
+    return "其他"
 
 
 class AIService:
@@ -34,11 +89,7 @@ class AIService:
                 ],
             }
         except Exception as e:
-            return {
-                "transcript": "",
-                "segments": [],
-                "error": str(e),
-            }
+            raise AIServiceError(f"转写音频失败: {_sanitize(str(e))}") from e
 
     async def diarize_speakers(
         self, audio_file_path: str, num_speakers: Optional[int] = None
@@ -65,7 +116,10 @@ class AIService:
 
             return segments
         except Exception as e:
-            return [{"error": str(e)}]
+            logger.warning(
+                "说话人分离不可用，按无分离结果继续: %s", _sanitize(str(e))
+            )
+            return []
 
     def align_transcript_with_speakers(
         self, transcript_segments: List[Dict[str, Any]], 
@@ -73,10 +127,20 @@ class AIService:
     ) -> List[Dict[str, Any]]:
         aligned_segments = []
 
-        for trans_seg in transcript_segments:
+        for index, trans_seg in enumerate(transcript_segments):
+            for key in ("start", "end", "text"):
+                if key not in trans_seg:
+                    raise AIServiceError(
+                        f"第 {index} 段转写缺少键 '{key}'"
+                    )
             trans_start = trans_seg["start"]
             trans_end = trans_seg["end"]
             trans_text = trans_seg["text"]
+            for key, value in (("start", trans_start), ("end", trans_end)):
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise AIServiceError(
+                        f"第 {index} 段转写的 '{key}' 不是数字: {value!r}"
+                    )
 
             best_speaker = None
             max_overlap = 0
@@ -142,7 +206,7 @@ class AIService:
             )
             return response.choices[0].message.content
         except Exception as e:
-            return f"生成摘要时出错: {str(e)}"
+            raise AIServiceError(f"生成会议纪要失败: {_sanitize(str(e))}") from e
 
     async def generate_fundraising_copy(self, summary: str, 
                                        hall_info: Dict) -> str:
@@ -176,7 +240,7 @@ class AIService:
             )
             return response.choices[0].message.content
         except Exception as e:
-            return f"生成募捐文案时出错: {str(e)}"
+            raise AIServiceError(f"生成募捐文案失败: {_sanitize(str(e))}") from e
 
     async def generate_merit_list(self, fundraising_copy: str) -> str:
         prompt = f"""你是一位寺庙的知客师，请根据以下募捐文案，撰写一份功德回向清单模板。
@@ -205,7 +269,7 @@ class AIService:
             )
             return response.choices[0].message.content
         except Exception as e:
-            return f"生成功德回向清单时出错: {str(e)}"
+            raise AIServiceError(f"生成功德回向清单失败: {_sanitize(str(e))}") from e
 
     async def identify_speaker_roles(
         self, aligned_segments: List[Dict[str, Any]]
@@ -219,8 +283,10 @@ class AIService:
 
         speaker_roles = {}
         for speaker, texts in speaker_texts.items():
+            if speaker == "UNKNOWN":
+                continue
             combined_text = " ".join(texts)
-            prompt = f"""根据以下对话内容，判断说话人{SPEAKER_NAMES.get(speaker, speaker)}的身份角色。
+            prompt = f"""根据以下对话内容，判断说话人 {_speaker_display_name(speaker)} 的身份角色。
 
 对话内容摘要：
 {combined_text[:2000]}
@@ -241,10 +307,16 @@ class AIService:
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.3,
                 )
-                role = response.choices[0].message.content.strip()
-                speaker_roles[speaker] = role
-            except Exception:
-                speaker_roles[speaker] = "未知"
+                speaker_roles[speaker] = _normalize_role(
+                    response.choices[0].message.content
+                )
+            except Exception as e:
+                logger.warning(
+                    "识别说话人 %s 的身份失败，归入「其他」: %s",
+                    speaker,
+                    _sanitize(str(e)),
+                )
+                speaker_roles[speaker] = "其他"
 
         return speaker_roles
 
